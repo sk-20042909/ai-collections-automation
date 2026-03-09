@@ -1,194 +1,323 @@
 """
-Streamlit Dashboard – AI-Driven Collections & Recovery
-=======================================================
-Multi-page dashboard:
-  1. Overview   – key metrics & recovery distribution
-  2. Risk Analysis – segment pie chart & probability histogram
-  3. Borrower Lookup – search & display individual borrower detail
-  4. Collection Strategy – top priority accounts table
-  5. Compliance Alerts – flagged borrowers list
+Streamlit Dashboard – AI Collections & Recovery  (7 pages)
+==========================================================
+Pages:
+    1. Overview              – KPIs, tier pie chart, probability histogram
+    2. Risk Analysis         – heatmap, distribution box-plots
+    3. Borrower Explorer     – searchable table with details
+    4. Collection Strategy   – strategy breakdown
+    5. Compliance Alerts     – flagged borrowers
+    6. Model Performance     – accuracy / AUC comparison, confusion matrices
+    7. SHAP Explainability   – global & local SHAP plots
 """
 
 import os
-import sys
+import json
+import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
-from sqlalchemy import create_engine, text
+from PIL import Image
 
-# ── Resolve paths relative to this file ──────────────────────────────────
-DASH_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.join(DASH_DIR, "..")
-DB_PATH = os.path.join(PROJECT_DIR, "data", "collections.db")
+# ---------------------------------------------------------------- paths ---
+BASE_DIR = os.path.join(os.path.dirname(__file__), "..")
+DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 
-if not os.path.exists(DB_PATH):
-    st.error(
-        f"Database not found at `{DB_PATH}`.  "
-        "Run `python run_project.py` first to generate all data."
-    )
-    st.stop()
 
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+@st.cache_data(show_spinner=False)
+def load_csv(name):
+    p = os.path.join(DATA_DIR, name)
+    return pd.read_csv(p) if os.path.exists(p) else pd.DataFrame()
 
-# ── Helpers ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300)
-def query(sql: str) -> pd.DataFrame:
-    with engine.connect() as conn:
-        return pd.read_sql(text(sql), conn)
+@st.cache_data(show_spinner=False)
+def load_metrics():
+    p = os.path.join(MODELS_DIR, "metrics.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            return json.load(f)
+    return []
 
-# ── Page config ──────────────────────────────────────────────────────────
+
+def load_image(name):
+    p = os.path.join(MODELS_DIR, name)
+    return Image.open(p) if os.path.exists(p) else None
+
+
+# ----------------------------------------------------------- page setup ---
 st.set_page_config(page_title="AI Collections Dashboard", layout="wide")
 st.title("🏦 AI-Driven Collections & Recovery Dashboard")
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["Overview", "Risk Analysis", "Borrower Lookup", "Collection Strategy", "Compliance Alerts"],
-)
+PAGES = [
+    "Overview",
+    "Risk Analysis",
+    "Borrower Explorer",
+    "Collection Strategy",
+    "Compliance Alerts",
+    "Model Performance",
+    "SHAP Explainability",
+]
+page = st.sidebar.radio("Navigate", PAGES)
 
-# ==================== 1. OVERVIEW =========================================
-if page == "Overview":
-    st.header("Overview")
+# ------------------------------------------------------------- helpers ---
 
-    borrowers = query("SELECT * FROM borrowers")
-    risk = query("SELECT * FROM risk_scores")
+TIER_COLORS = {
+    "Low Risk": "#2ecc71",
+    "Medium Risk": "#f1c40f",
+    "High Risk": "#e67e22",
+    "Very High Risk": "#e74c3c",
+}
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Borrowers", f"{len(borrowers):,}")
-    overdue = borrowers[borrowers["days_past_due"] > 0]
-    col2.metric("Overdue Borrowers", f"{len(overdue):,}")
-    col3.metric("Avg Credit Score", f"{borrowers['credit_score'].mean():.0f}")
-    col4.metric("Recovery Rate", f"{borrowers['recovered'].mean()*100:.1f}%")
 
-    st.subheader("Recovery Probability Distribution")
-    fig = px.histogram(
-        risk,
-        x="repayment_probability",
-        nbins=40,
-        color_discrete_sequence=["#636EFA"],
-        labels={"repayment_probability": "Repayment Probability"},
-    )
-    fig.update_layout(bargap=0.05)
-    st.plotly_chart(fig, width="stretch")
+# ============================================================ PAGE 1 ====
+def page_overview():
+    st.header("📊 Overview")
+    segments = load_csv("risk_segments.csv")
+    borrowers = load_csv("borrowers_processed.csv")
 
-    st.subheader("Days Past Due Distribution")
-    fig2 = px.histogram(
-        borrowers,
-        x="days_past_due",
-        nbins=50,
-        color_discrete_sequence=["#EF553B"],
-    )
-    st.plotly_chart(fig2, width="stretch")
+    if segments.empty:
+        st.warning("No data – run the pipeline first.")
+        return
 
-# ==================== 2. RISK ANALYSIS ====================================
-elif page == "Risk Analysis":
-    st.header("Risk Analysis")
-
-    risk = query("SELECT * FROM risk_scores")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Borrowers", f"{len(borrowers):,}")
+    c2.metric("Default Rate",
+              f"{borrowers['default'].mean()*100:.1f}%" if "default" in borrowers else "N/A")
+    c3.metric("Avg Default Prob",
+              f"{segments['default_probability'].mean():.2%}")
+    c4.metric("High/V.High Risk",
+              f"{len(segments[segments['risk_tier'].isin(['High Risk','Very High Risk'])]):,}")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Risk Segment Distribution")
-        counts = risk["risk_segment"].value_counts().reset_index()
-        counts.columns = ["risk_segment", "count"]
-        fig = px.pie(
-            counts,
-            names="risk_segment",
-            values="count",
-            color="risk_segment",
-            color_discrete_map={
-                "Low Risk": "#2ecc71",
-                "Medium Risk": "#f39c12",
-                "High Risk": "#e74c3c",
-            },
-            hole=0.35,
-        )
-        st.plotly_chart(fig, width="stretch")
+        tier_counts = segments["risk_tier"].value_counts().reset_index()
+        tier_counts.columns = ["risk_tier", "count"]
+        fig = px.pie(tier_counts, names="risk_tier", values="count",
+                     title="Risk Tier Distribution",
+                     color="risk_tier", color_discrete_map=TIER_COLORS)
+        st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        st.subheader("Probability Histogram by Segment")
-        fig2 = px.histogram(
-            risk,
-            x="repayment_probability",
-            color="risk_segment",
-            nbins=40,
-            color_discrete_map={
-                "Low Risk": "#2ecc71",
-                "Medium Risk": "#f39c12",
-                "High Risk": "#e74c3c",
-            },
-            barmode="overlay",
-            opacity=0.65,
-        )
-        st.plotly_chart(fig2, width="stretch")
+        fig = px.histogram(segments, x="default_probability", nbins=50,
+                           title="Default Probability Distribution",
+                           color_discrete_sequence=["#3498db"])
+        fig.add_vline(x=0.30, line_dash="dash", line_color="orange",
+                      annotation_text="Medium threshold")
+        fig.add_vline(x=0.60, line_dash="dash", line_color="red",
+                      annotation_text="High threshold")
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Segment Summary Statistics")
-    summary = (
-        risk.groupby("risk_segment")["repayment_probability"]
-        .describe()
-        .round(3)
-    )
-    st.dataframe(summary)
 
-# ==================== 3. BORROWER LOOKUP ==================================
-elif page == "Borrower Lookup":
-    st.header("Borrower Lookup")
+# ============================================================ PAGE 2 ====
+def page_risk_analysis():
+    st.header("📈 Risk Analysis")
+    segments = load_csv("risk_segments.csv")
+    borrowers = load_csv("borrowers_processed.csv")
+    if segments.empty:
+        st.warning("No data.")
+        return
 
-    search = st.text_input("Enter Borrower ID (e.g. BRW-00001)")
+    # Safely select only columns that exist in the processed data
+    merge_cols = ["borrower_id"] + [c for c in ["age", "credit_limit", "education"]
+                                     if c in borrowers.columns]
+    merged = segments.merge(borrowers[merge_cols], on="borrower_id", how="left")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = px.box(merged, x="risk_tier", y="default_probability",
+                     color="risk_tier", color_discrete_map=TIER_COLORS,
+                     title="Default Probability by Risk Tier")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig = px.scatter(merged, x="age", y="default_probability",
+                         color="risk_tier", color_discrete_map=TIER_COLORS,
+                         title="Age vs. Default Probability", opacity=0.4)
+        st.plotly_chart(fig, use_container_width=True)
+
+    fig = px.box(merged, x="risk_tier", y="credit_limit",
+                 color="risk_tier", color_discrete_map=TIER_COLORS,
+                 title="Credit Limit by Risk Tier")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================ PAGE 3 ====
+def page_borrower_explorer():
+    st.header("🔍 Borrower Explorer")
+    borrowers = load_csv("borrowers_processed.csv")
+    segments = load_csv("risk_segments.csv")
+    if borrowers.empty:
+        st.warning("No data.")
+        return
+
+    merged = borrowers.merge(segments, on="borrower_id", how="left")
+
+    search = st.text_input("Search by Borrower ID (e.g. BRW-00001)")
+    tier_filter = st.multiselect("Filter by Risk Tier",
+                                 ["Low Risk", "Medium Risk", "High Risk", "Very High Risk"])
+
+    if tier_filter:
+        merged = merged[merged["risk_tier"].isin(tier_filter)]
     if search:
-        safe_id = search.strip()
-        borrower = query(
-            f"SELECT * FROM borrowers WHERE borrower_id = '{safe_id}'"
-        )
-        risk_row = query(
-            f"SELECT * FROM risk_scores WHERE borrower_id = '{safe_id}'"
-        )
-        action_row = query(
-            f"SELECT * FROM collection_actions WHERE borrower_id = '{safe_id}'"
-        )
+        merged = merged[merged["borrower_id"].str.contains(search, case=False, na=False)]
 
-        if borrower.empty:
-            st.warning("Borrower not found.")
-        else:
-            st.subheader("Borrower Profile")
-            st.dataframe(borrower.T.rename(columns={borrower.index[0]: "Value"}))
+    st.dataframe(merged.head(200), use_container_width=True)
 
-            if not risk_row.empty:
-                st.subheader("Risk Assessment")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Repayment Probability", f"{risk_row.iloc[0]['repayment_probability']:.2%}")
-                c2.metric("Risk Segment", risk_row.iloc[0]["risk_segment"])
-                c3.metric("Priority Score", f"{risk_row.iloc[0]['priority_score']:.4f}")
+    if search and not merged.empty:
+        row = merged.iloc[0]
+        st.subheader(f"Details for {row['borrower_id']}")
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.metric("Default Probability", f"{row.get('default_probability', 0):.2%}")
+        dc2.metric("Risk Tier", row.get("risk_tier", "N/A"))
+        dc3.metric("Priority Score", row.get("priority_score", "N/A"))
 
-            if not action_row.empty:
-                st.subheader("Recommended Action")
-                st.info(
-                    f"**{action_row.iloc[0]['recommended_action']}** "
-                    f"(Urgency: {action_row.iloc[0]['urgency_level']}, "
-                    f"Rank: {action_row.iloc[0]['priority_rank']})"
-                )
 
-# ==================== 4. COLLECTION STRATEGY ==============================
-elif page == "Collection Strategy":
-    st.header("Collection Strategy – Top Priority Accounts")
+# ============================================================ PAGE 4 ====
+def page_collection_strategy():
+    st.header("📋 Collection Strategy")
+    strats = load_csv("collection_strategies.csv")
+    if strats.empty:
+        st.warning("No data.")
+        return
 
-    n = st.slider("Number of accounts to show", 10, 200, 50)
-    actions = query(
-        f"SELECT * FROM collection_actions ORDER BY priority_rank ASC LIMIT {int(n)}"
-    )
-    risk = query("SELECT * FROM risk_scores")
-    merged = actions.merge(risk, on="borrower_id", how="left")
-    st.dataframe(merged, width="stretch", height=500)
+    tier_summary = strats.groupby("risk_tier").agg(
+        count=("borrower_id", "count"),
+        avg_priority=("priority_score", "mean"),
+    ).reset_index()
 
-# ==================== 5. COMPLIANCE ALERTS ================================
-elif page == "Compliance Alerts":
-    st.header("Compliance Alerts")
+    fig = px.bar(tier_summary, x="risk_tier", y="count",
+                 color="risk_tier", color_discrete_map=TIER_COLORS,
+                 title="Accounts per Strategy Tier")
+    st.plotly_chart(fig, use_container_width=True)
 
-    flags = query("SELECT * FROM compliance_flags WHERE compliance_status = 'FAIL'")
-    st.metric("Total Violations", f"{len(flags):,}")
+    st.subheader("Strategy Details")
+    for tier in ["Low Risk", "Medium Risk", "High Risk", "Very High Risk"]:
+        subset = strats[strats["risk_tier"] == tier]
+        if subset.empty:
+            continue
+        with st.expander(f"{tier} ({len(subset)} accounts)"):
+            row = subset.iloc[0]
+            st.markdown(f"**Action:** {row['recommended_action']}")
+            st.markdown(f"**Channel:** {row['channel']}")
+            st.markdown(f"**Urgency:** {row['urgency']}")
+            st.markdown(f"**Follow-up:** every {row['follow_up_days']} days")
+            st.markdown(f"**Description:** {row['description']}")
 
-    if not flags.empty:
-        st.dataframe(flags, width="stretch", height=500)
-    else:
-        st.success("No compliance violations found.")
+
+# ============================================================ PAGE 5 ====
+def page_compliance_alerts():
+    st.header("⚠️ Compliance Alerts")
+    flags = load_csv("compliance_flags.csv")
+    if flags.empty:
+        st.warning("No data.")
+        return
+
+    c1, c2 = st.columns(2)
+    flagged = flags[flags["flag_count"] > 0]
+    c1.metric("Total Flagged", len(flagged))
+    c2.metric("Clear", len(flags) - len(flagged))
+
+    fig = px.histogram(flags, x="flag_count", nbins=10,
+                       title="Flag Count Distribution",
+                       color_discrete_sequence=["#e74c3c"])
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Flagged Borrowers")
+    st.dataframe(flagged.head(200), use_container_width=True)
+
+
+# ============================================================ PAGE 6 ====
+def page_model_performance():
+    st.header("🤖 Model Performance")
+    metrics = load_metrics()
+    if not metrics:
+        st.warning("No metrics – run training first.")
+        return
+
+    mdf = pd.DataFrame(metrics)
+    st.dataframe(mdf, use_container_width=True)
+
+    # Bar chart of AUC
+    fig = px.bar(mdf, x="model", y="roc_auc", color="model",
+                 title="ROC-AUC by Model",
+                 text_auto=True)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Radar chart
+    cats = ["accuracy", "precision", "recall", "f1_score", "roc_auc"]
+    fig = go.Figure()
+    for _, row in mdf.iterrows():
+        fig.add_trace(go.Scatterpolar(
+            r=[row[c] for c in cats],
+            theta=cats,
+            fill="toself",
+            name=row["model"],
+        ))
+    fig.update_layout(title="Model Comparison (Radar)", polar=dict(radialaxis=dict(range=[0, 1])))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Confusion matrices
+    st.subheader("Confusion Matrices")
+    cols = st.columns(len(metrics))
+    for idx, m in enumerate(metrics):
+        img = load_image(f"{m['model']}_confusion.png")
+        if img:
+            cols[idx].image(img, caption=m["model"], use_container_width=True)
+
+    # ROC curves
+    roc_img = load_image("roc_curves.png")
+    if roc_img:
+        st.image(roc_img, caption="ROC Curves", use_container_width=True)
+
+
+# ============================================================ PAGE 7 ====
+def page_shap_explainability():
+    st.header("🔬 SHAP Explainability")
+
+    shap_summary = load_image("shap_summary.png")
+    shap_dot = load_image("shap_dot.png")
+    fi_img = load_image("feature_importance.png")
+
+    if shap_summary is None and shap_dot is None:
+        st.warning("No SHAP plots found – ensure SHAP ran during training.")
+        return
+
+    st.subheader("Global Feature Importance (SHAP Bar)")
+    if shap_summary:
+        st.image(shap_summary, use_container_width=True)
+
+    st.subheader("SHAP Summary (Dot Plot)")
+    if shap_dot:
+        st.image(shap_dot, use_container_width=True)
+
+    if fi_img:
+        st.subheader("Sklearn Feature Importance (Best Model)")
+        st.image(fi_img, use_container_width=True)
+
+    # Show SHAP values table
+    shap_csv = os.path.join(MODELS_DIR, "shap_values.csv")
+    if os.path.exists(shap_csv):
+        st.subheader("SHAP Values (sample)")
+        sdf = pd.read_csv(shap_csv)
+        st.dataframe(sdf.head(50), use_container_width=True)
+
+        # Top features by mean |SHAP|
+        mean_abs = sdf.abs().mean().sort_values(ascending=False).head(15)
+        fig = px.bar(x=mean_abs.values, y=mean_abs.index, orientation="h",
+                     title="Top 15 Features by Mean |SHAP Value|",
+                     labels={"x": "Mean |SHAP|", "y": "Feature"})
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ------------------------------------------------------------ routing ---
+PAGE_MAP = {
+    "Overview": page_overview,
+    "Risk Analysis": page_risk_analysis,
+    "Borrower Explorer": page_borrower_explorer,
+    "Collection Strategy": page_collection_strategy,
+    "Compliance Alerts": page_compliance_alerts,
+    "Model Performance": page_model_performance,
+    "SHAP Explainability": page_shap_explainability,
+}
+
+PAGE_MAP[page]()

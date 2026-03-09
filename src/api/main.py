@@ -1,122 +1,93 @@
 """
-FastAPI Backend – AI-Driven Collections & Recovery
-====================================================
-Endpoints
----------
-GET  /borrowers          – list all borrowers (paginated)
-GET  /borrower/{id}      – single borrower detail + risk + action
-POST /predict            – predict recovery probability for a payload
-GET  /actions            – list collection actions (sorted by priority)
-GET  /compliance         – list compliance flags (optionally filter FAIL only)
+FastAPI – Collections & Recovery API
+=====================================
+Endpoints:
+    GET  /                   – health check
+    GET  /borrowers          – paginated borrower list
+    GET  /borrower/{id}      – single borrower detail + risk + strategy
+    GET  /risk-distribution  – risk-tier counts
+    GET  /model-metrics      – all model evaluation metrics
+    GET  /compliance-flags   – borrowers with active flags
 """
 
 import os
 import json
-import numpy as np
-import pandas as pd
-import joblib
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from sqlalchemy import create_engine, text
 
-# ── Paths ────────────────────────────────────────────────────────────────
-API_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.join(API_DIR, "..", "..")
-DB_PATH = os.path.join(PROJECT_DIR, "data", "collections.db")
-MODEL_PATH = os.path.join(PROJECT_DIR, "models", "best_model.pkl")
-COLS_PATH = os.path.join(PROJECT_DIR, "models", "feature_columns.json")
+import pandas as pd
 
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+app = FastAPI(title="AI Collections & Recovery API", version="2.0")
 
-app = FastAPI(
-    title="AI Collections API",
-    description="REST API for the AI-Driven Collections & Recovery system.",
-    version="1.0.0",
-)
-
-# ── Load model once ──────────────────────────────────────────────────────
-_model = None
-_feature_cols = None
+BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 
-def _get_model():
-    global _model, _feature_cols
-    if _model is None:
-        _model = joblib.load(MODEL_PATH)
-        with open(COLS_PATH) as f:
-            _feature_cols = json.load(f)
-    return _model, _feature_cols
+def _read_csv(name: str) -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"{name} not found – run the pipeline first.")
+    return pd.read_csv(path)
 
 
-# ── Pydantic schemas ─────────────────────────────────────────────────────
+@app.get("/")
+def health():
+    return {"status": "ok", "version": "2.0", "dataset": "UCI Credit Card Default"}
 
-class PredictRequest(BaseModel):
-    """Accepts a dictionary of feature values for a single borrower."""
-    features: dict
-
-
-class PredictResponse(BaseModel):
-    repayment_probability: float
-    risk_segment: str
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-def _query(sql: str) -> list[dict]:
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql))
-        cols = rows.keys()
-        return [dict(zip(cols, r)) for r in rows.fetchall()]
-
-
-# ── Endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/borrowers")
-def list_borrowers(skip: int = 0, limit: int = Query(default=50, le=500)):
-    rows = _query(f"SELECT * FROM borrowers LIMIT {int(limit)} OFFSET {int(skip)}")
-    return {"count": len(rows), "data": rows}
+def list_borrowers(skip: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=500)):
+    df = _read_csv("borrowers_processed.csv")
+    page = df.iloc[skip : skip + limit]
+    return {"total": len(df), "skip": skip, "limit": limit,
+            "data": page.to_dict(orient="records")}
 
 
 @app.get("/borrower/{borrower_id}")
 def get_borrower(borrower_id: str):
-    b = _query(f"SELECT * FROM borrowers WHERE borrower_id = '{borrower_id}'")
-    if not b:
-        raise HTTPException(404, "Borrower not found")
-    r = _query(f"SELECT * FROM risk_scores WHERE borrower_id = '{borrower_id}'")
-    a = _query(f"SELECT * FROM collection_actions WHERE borrower_id = '{borrower_id}'")
-    return {"borrower": b[0], "risk": r[0] if r else None, "action": a[0] if a else None}
+    df = _read_csv("borrowers_processed.csv")
+    row = df[df["borrower_id"] == borrower_id]
+    if row.empty:
+        raise HTTPException(404, f"Borrower {borrower_id} not found.")
+    info = row.iloc[0].to_dict()
+
+    # Risk
+    risk_df = _read_csv("risk_segments.csv")
+    risk = risk_df[risk_df["borrower_id"] == borrower_id]
+    info["risk"] = risk.iloc[0].to_dict() if not risk.empty else None
+
+    # Strategy
+    strat_df = _read_csv("collection_strategies.csv")
+    strat = strat_df[strat_df["borrower_id"] == borrower_id]
+    info["strategy"] = strat.iloc[0].to_dict() if not strat.empty else None
+
+    return info
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    model, cols = _get_model()
-    assert cols is not None, "Feature columns not loaded"
-    row = {c: 0 for c in cols}
-    row.update(req.features)
-    X = pd.DataFrame([row])[cols]
-    prob = float(model.predict_proba(X)[0, 1])
-    if prob > 0.75:
-        seg = "Low Risk"
-    elif prob >= 0.45:
-        seg = "Medium Risk"
-    else:
-        seg = "High Risk"
-    return PredictResponse(repayment_probability=round(prob, 4), risk_segment=seg)
+@app.get("/risk-distribution")
+def risk_distribution():
+    df = _read_csv("risk_segments.csv")
+    counts = df["risk_tier"].value_counts().to_dict()
+    return {"distribution": counts, "total": len(df)}
 
 
-@app.get("/actions")
-def list_actions(limit: int = Query(default=50, le=500)):
-    rows = _query(
-        f"SELECT ca.*, rs.repayment_probability, rs.risk_segment "
-        f"FROM collection_actions ca "
-        f"LEFT JOIN risk_scores rs ON ca.borrower_id = rs.borrower_id "
-        f"ORDER BY ca.priority_rank ASC LIMIT {int(limit)}"
-    )
-    return {"count": len(rows), "data": rows}
+@app.get("/model-metrics")
+def model_metrics():
+    path = os.path.join(MODELS_DIR, "metrics.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, "metrics.json not found.")
+    with open(path) as f:
+        return json.load(f)
 
 
-@app.get("/compliance")
-def list_compliance(fail_only: bool = False):
-    where = "WHERE compliance_status = 'FAIL'" if fail_only else ""
-    rows = _query(f"SELECT * FROM compliance_flags {where}")
-    return {"count": len(rows), "data": rows}
+@app.get("/compliance-flags")
+def compliance_flags(min_flags: int = Query(1, ge=0)):
+    df = _read_csv("compliance_flags.csv")
+    flagged = df[df["flag_count"] >= min_flags]
+    return {"total_flagged": len(flagged),
+            "data": flagged.to_dict(orient="records")}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=True)

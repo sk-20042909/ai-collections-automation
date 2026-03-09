@@ -1,27 +1,29 @@
 """
-ML Model Training & Evaluation
-================================
-Trains three classifiers to predict the ``recovered`` target:
+ML Model Training & Evaluation + SHAP Explainability
+=====================================================
+Trains four classifiers to predict credit-card default:
     1. Logistic Regression
     2. Random Forest
     3. XGBoost
+    4. Gradient Boosting
 
-Evaluation metrics: Accuracy, Precision, Recall, F1-Score, ROC-AUC.
-Plots: Confusion matrix, ROC curve, Feature importance.
+Evaluation: Accuracy, Precision, Recall, F1, ROC-AUC.
+Plots: Confusion matrices, ROC curves, Feature importance, SHAP summary.
 The best model (by ROC-AUC) is persisted via Joblib.
 """
 
 import os
 import json
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")           # non-interactive backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -40,20 +42,29 @@ except ImportError:
     XGBClassifier = None
     HAS_XGB = False
 
-# ------------------------------------------------------------------ helpers ---
+try:
+    import shap
+except ImportError:
+    shap = None  # type: ignore[assignment]
+
+HAS_SHAP = shap is not None
 
 BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
 
 
+# ---------------------------------------------------------------- helpers ---
+
 def _load_data(path: str | None = None):
     if path is None:
         path = os.path.join(DATA_DIR, "borrowers_processed.csv")
     df = pd.read_csv(path)
-    drop_cols = [c for c in ["borrower_id"] if c in df.columns]
-    X = df.drop(columns=["recovered"] + drop_cols)
-    y = df["recovered"]
+    # Drop ID, target, and preserved original categorical columns (dashboard-only)
+    non_feature_cols = ["borrower_id", "gender", "education", "marital_status"]
+    drop_cols = [c for c in non_feature_cols if c in df.columns]
+    X = df.drop(columns=["default"] + drop_cols, errors="ignore")
+    y = df["default"]
     return train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
 
@@ -86,7 +97,7 @@ def _plot_confusion(name, y_test, y_pred, out_dir):
     plt.close(fig)
 
 
-def _plot_roc(results: list, X_test, y_test, out_dir):
+def _plot_roc(results, X_test, y_test, out_dir):
     fig, ax = plt.subplots()
     for name, model, _, _ in results:
         y_prob = model.predict_proba(X_test)[:, 1]
@@ -116,10 +127,60 @@ def _plot_feature_importance(model, feature_names, out_dir):
     plt.close(fig)
 
 
-# -------------------------------------------------------------------- main ---
+def _generate_shap(model, X_train, X_test, out_dir):
+    """Generate SHAP summary plot and save SHAP values for dashboard use."""
+    if not HAS_SHAP or shap is None:
+        print("[ml_models] SHAP not installed – skipping explainability plots.")
+        return
+
+    print("[ml_models] Generating SHAP explanations …")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Use a sample for speed
+        sample_size = min(500, len(X_test))
+        X_sample = X_test.iloc[:sample_size]
+
+        if hasattr(model, "feature_importances_"):
+            explainer = shap.TreeExplainer(model)
+        else:
+            bg = shap.sample(X_train, 100)
+            explainer = shap.LinearExplainer(model, bg)
+
+        shap_values = explainer.shap_values(X_sample)
+
+        # For tree models shap_values may be a list [class0, class1]
+        # or a 3-D array (samples, features, classes)
+        if isinstance(shap_values, list):
+            sv = shap_values[1]
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            sv = shap_values[:, :, 1]
+        else:
+            sv = shap_values
+
+        # Summary bar plot
+        fig, ax = plt.subplots(figsize=(10, 7))
+        shap.summary_plot(sv, X_sample, plot_type="bar", show=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "shap_summary.png"), bbox_inches="tight")
+        plt.close("all")
+
+        # Summary dot plot
+        fig, ax = plt.subplots(figsize=(10, 7))
+        shap.summary_plot(sv, X_sample, show=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "shap_dot.png"), bbox_inches="tight")
+        plt.close("all")
+
+        # Save SHAP values for dashboard use
+        shap_df = pd.DataFrame(sv, columns=X_sample.columns)
+        shap_df.to_csv(os.path.join(out_dir, "shap_values.csv"), index=False)
+        print(f"[ml_models] SHAP plots & values saved -> {out_dir}")
+
+
+# ------------------------------------------------------------------ main ---
 
 def train_all(data_path: str | None = None) -> str:
-    """Train models, evaluate, plot, and save the best one."""
+    """Train models, evaluate, plot, generate SHAP, and save the best."""
     os.makedirs(MODELS_DIR, exist_ok=True)
     X_train, X_test, y_train, y_test = _load_data(data_path)
 
@@ -127,6 +188,9 @@ def train_all(data_path: str | None = None) -> str:
         "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
         "RandomForest": RandomForestClassifier(
             n_estimators=200, max_depth=12, random_state=42, n_jobs=-1
+        ),
+        "GradientBoosting": GradientBoostingClassifier(
+            n_estimators=200, max_depth=6, learning_rate=0.1, random_state=42
         ),
     }
     if HAS_XGB and XGBClassifier is not None:
@@ -138,7 +202,7 @@ def train_all(data_path: str | None = None) -> str:
             random_state=42,
         )
 
-    results = []   # (name, model, metrics_dict, y_prob)
+    results = []
     for name, clf in models.items():
         print(f"[ml_models] Training {name} …")
         clf.fit(X_train, y_train)
@@ -147,28 +211,23 @@ def train_all(data_path: str | None = None) -> str:
         _plot_confusion(name, y_test, y_pred, MODELS_DIR)
         results.append((name, clf, metrics, y_prob))
 
-    # ROC curve comparison
     _plot_roc(results, X_test, y_test, MODELS_DIR)
 
-    # Select best model by ROC-AUC
+    # Best model
     best_name, best_model, best_metrics, _ = max(results, key=lambda r: r[2]["roc_auc"])
     model_path = os.path.join(MODELS_DIR, "best_model.pkl")
     joblib.dump(best_model, model_path)
-    print(f"[ml_models] Best model: {best_name} (AUC={best_metrics['roc_auc']})")
+    print(f"[ml_models] Best: {best_name} (AUC={best_metrics['roc_auc']})")
     print(f"[ml_models] Saved -> {model_path}")
 
-    # Feature importance for best model
     _plot_feature_importance(best_model, list(X_train.columns), MODELS_DIR)
+    _generate_shap(best_model, X_train, X_test, MODELS_DIR)
 
-    # Save metrics summary
+    # Persist metrics & column order
     all_metrics = [r[2] for r in results]
-    metrics_path = os.path.join(MODELS_DIR, "metrics.json")
-    with open(metrics_path, "w") as f:
+    with open(os.path.join(MODELS_DIR, "metrics.json"), "w") as f:
         json.dump(all_metrics, f, indent=2)
-
-    # Save column order for inference
-    cols_path = os.path.join(MODELS_DIR, "feature_columns.json")
-    with open(cols_path, "w") as f:
+    with open(os.path.join(MODELS_DIR, "feature_columns.json"), "w") as f:
         json.dump(list(X_train.columns), f)
 
     return model_path

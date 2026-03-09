@@ -1,88 +1,109 @@
 """
 Risk Segmentation Module
-=========================
-Uses the trained model to predict repayment probability for every borrower,
-then assigns a risk segment and a priority score.
+========================
+Assigns risk tiers based on default-probability thresholds:
+    Low Risk:       default_prob < 0.30
+    Medium Risk:    0.30 <= default_prob < 0.60
+    High Risk:      0.60 <= default_prob < 0.80
+    Very High Risk: default_prob >= 0.80
 
-Segments
---------
-- Low Risk    : probability > 0.75
-- Medium Risk : 0.45 ≤ probability ≤ 0.75
-- High Risk   : probability < 0.45
+A composite *priority_score* (0-100) is also computed to enable
+fine-grained ranking within each tier.
 """
 
 import os
-import json
 import numpy as np
 import pandas as pd
 import joblib
 
 BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
+DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
 
 
-def _load_model():
-    return joblib.load(os.path.join(MODELS_DIR, "best_model.pkl"))
+def _load_model_and_data():
+    model = joblib.load(os.path.join(MODELS_DIR, "best_model.pkl"))
+    df = pd.read_csv(os.path.join(DATA_DIR, "borrowers_processed.csv"))
+    return model, df
 
 
-def _load_columns():
-    with open(os.path.join(MODELS_DIR, "feature_columns.json")) as f:
-        return json.load(f)
+def _get_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the feature matrix (drop ID + target)."""
+    import json
+    cols_path = os.path.join(MODELS_DIR, "feature_columns.json")
+    with open(cols_path) as f:
+        feature_cols = json.load(f)
+    return df[feature_cols]
 
 
-def _align_columns(df: pd.DataFrame, expected_cols: list) -> pd.DataFrame:
-    """Ensure df has exactly the columns the model expects."""
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = 0
-    return df[expected_cols]
+def assign_risk_tier(prob: float) -> str:
+    if prob < 0.30:
+        return "Low Risk"
+    if prob < 0.60:
+        return "Medium Risk"
+    if prob < 0.80:
+        return "High Risk"
+    return "Very High Risk"
 
 
-def segment_borrowers(processed_path: str | None = None) -> pd.DataFrame:
-    """Predict repayment probability and assign risk segments."""
-    if processed_path is None:
-        processed_path = os.path.join(
-            BASE_DIR, "data", "processed", "borrowers_processed.csv"
-        )
-    df = pd.read_csv(processed_path)
+def compute_priority_score(row: pd.Series) -> float:
+    """
+    Weighted composite score (0-100).
+    Higher = more urgent for collections outreach.
+    """
+    prob = row.get("default_probability", 0.5)
+    credit_util = row.get("credit_utilization_index", 0.5)
+    delinquency = row.get("delinquency_score", 0)
+    max_delinq = max(delinquency, 1)  # avoid /0
+    score = (
+        prob * 40
+        + min(credit_util, 1.0) * 25
+        + min(delinquency / max_delinq, 1.0) * 25
+        + np.random.uniform(0, 10)  # tiny jitter for tie-breaking
+    )
+    return round(float(np.clip(score, 0, 100)), 2)
 
-    model = _load_model()
-    feature_cols = _load_columns()
 
-    # Keep borrower_id for output
-    ids = df["borrower_id"] if "borrower_id" in df.columns else pd.Series(range(len(df)))
+def segment(df: pd.DataFrame | None = None):
+    """
+    Run segmentation.
+    Returns a DataFrame with borrower_id, default_probability, risk_tier,
+    and priority_score.
+    """
+    model, data = _load_model_and_data()
+    if df is None:
+        df = data
 
-    X = _align_columns(df.drop(columns=["recovered", "borrower_id"], errors="ignore"), feature_cols)
+    X = _get_features(df)
     probs = model.predict_proba(X)[:, 1]
 
     result = pd.DataFrame({
-        "borrower_id": ids,
-        "repayment_probability": np.round(probs, 4),
+        "borrower_id": df["borrower_id"].values,
+        "default_probability": np.round(probs, 4),
     })
+    result["repayment_probability"] = np.round(1.0 - result["default_probability"], 4)
+    result["risk_tier"] = result["default_probability"].apply(assign_risk_tier)
 
-    result["risk_segment"] = pd.cut(
-        result["repayment_probability"],
-        bins=[-0.01, 0.45, 0.75, 1.01],
-        labels=["High Risk", "Medium Risk", "Low Risk"],
-    )
+    # Merge useful columns for priority calculation
+    for col in ["credit_utilization_index", "delinquency_score"]:
+        if col in df.columns:
+            result[col] = df[col].values
+    result["priority_score"] = result.apply(compute_priority_score, axis=1)
 
-    # Priority score: higher = more urgent (inverse of probability)
-    result["priority_score"] = np.round(1 - result["repayment_probability"], 4)
+    # Drop helper columns
+    result.drop(columns=["credit_utilization_index", "delinquency_score"],
+                errors="ignore", inplace=True)
 
+    tier_counts = result["risk_tier"].value_counts()
+    print("[segmentation] Tier distribution:")
+    for tier, count in tier_counts.items():
+        print(f"  {tier}: {count}")
+
+    out_path = os.path.join(DATA_DIR, "risk_segments.csv")
+    result.to_csv(out_path, index=False)
+    print(f"[segmentation] Saved -> {out_path}")
     return result
 
 
-def save_segments(output_dir: str | None = None) -> str:
-    """Run segmentation and save to CSV."""
-    df = segment_borrowers()
-    if output_dir is None:
-        output_dir = os.path.join(BASE_DIR, "data", "processed")
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "risk_segments.csv")
-    df.to_csv(path, index=False)
-    print(f"[segmentation] Saved {len(df)} segments -> {path}")
-    return path
-
-
 if __name__ == "__main__":
-    save_segments()
+    segment()

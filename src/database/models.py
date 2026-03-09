@@ -1,139 +1,253 @@
 """
-Database Layer – SQLAlchemy ORM + SQLite
-=========================================
-Defines five tables and provides helpers to populate them from CSV outputs.
-
-Tables
-------
-- borrowers           : Raw borrower attributes
-- risk_scores         : Model predictions & risk segments
-- collection_actions  : Recommended actions per borrower
-- communication_logs  : Simulated contact messages
-- compliance_flags    : Compliance check results
+Database Models (SQLAlchemy + SQLite)
+=====================================
+Six tables:
+    borrowers           – cleaned UCI data
+    risk_scores         – default probability & tier
+    collection_actions  – strategy assignments
+    communication_logs  – outreach messages
+    compliance_flags    – compliance check results
+    model_metrics       – per-model training metrics
 """
 
 import os
+import json
 import pandas as pd
 from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    Float,
-    String,
-    Text,
-    DateTime,
+    create_engine, Column, Integer, Float, String, Text, DateTime,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
 
 BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
 DB_PATH = os.path.join(BASE_DIR, "data", "collections.db")
-DB_URL = f"sqlite:///{DB_PATH}"
+DATA_DIR = os.path.join(BASE_DIR, "data", "processed")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 
-engine = create_engine(DB_URL, echo=False)
-SessionLocal = sessionmaker(bind=engine)
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
 Base = declarative_base()
+Session = sessionmaker(bind=engine)
 
 
-# ───────────────────────────────── Models ─────────────────────────────────
+# ---------------------------------------------------------------- tables ---
 
 class Borrower(Base):
     __tablename__ = "borrowers"
-    borrower_id = Column(String(20), primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    borrower_id = Column(String(20), unique=True, nullable=False)
+    credit_limit = Column(Float)
+    gender = Column(Integer)
+    education = Column(Integer)
+    marital_status = Column(Integer)
     age = Column(Integer)
-    employment_status = Column(String(30))
-    monthly_income = Column(Float)
-    credit_score = Column(Integer)
-    loan_amount = Column(Float)
-    interest_rate = Column(Float)
-    loan_tenure_months = Column(Integer)
-    emi_amount = Column(Float)
-    days_past_due = Column(Integer)
-    number_of_missed_payments = Column(Integer)
-    last_payment_amount = Column(Float)
-    contact_response_rate = Column(Float)
-    prior_collection_attempts = Column(Integer)
-    preferred_contact_channel = Column(String(20))
-    outstanding_balance = Column(Float)
-    region = Column(String(20))
-    customer_tenure = Column(Integer)
-    repayment_status = Column(String(20))
-    recovered = Column(Integer)
+    default = Column(Integer)
 
 
 class RiskScore(Base):
     __tablename__ = "risk_scores"
-    borrower_id = Column(String(20), primary_key=True)
-    repayment_probability = Column(Float)
-    risk_segment = Column(String(20))
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    borrower_id = Column(String(20), nullable=False)
+    default_probability = Column(Float)
+    risk_tier = Column(String(30))
     priority_score = Column(Float)
+    scored_at = Column(DateTime, default=datetime.utcnow)
 
 
 class CollectionAction(Base):
     __tablename__ = "collection_actions"
-    borrower_id = Column(String(20), primary_key=True)
-    recommended_action = Column(String(50))
-    urgency_level = Column(String(20))
-    priority_rank = Column(Integer)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    borrower_id = Column(String(20), nullable=False)
+    risk_tier = Column(String(30))
+    recommended_action = Column(Text)
+    channel = Column(String(50))
+    urgency = Column(String(20))
+    follow_up_days = Column(Integer)
+    assigned_at = Column(DateTime, default=datetime.utcnow)
 
 
 class CommunicationLog(Base):
     __tablename__ = "communication_logs"
-    log_id = Column(String(40), primary_key=True)
-    borrower_id = Column(String(20))
-    channel = Column(String(20))
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    borrower_id = Column(String(20), nullable=False)
+    risk_tier = Column(String(30))
+    channel = Column(String(50))
+    template = Column(String(40))
     message = Column(Text)
-    timestamp = Column(String(30))
-    status = Column(String(20))
+    generated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ComplianceFlag(Base):
     __tablename__ = "compliance_flags"
-    borrower_id = Column(String(20), primary_key=True)
-    risk_segment = Column(String(20))
-    recommended_action = Column(String(50))
-    compliance_status = Column(String(10))
-    violation_reason = Column(Text)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    borrower_id = Column(String(20), nullable=False)
+    risk_tier = Column(String(30))
+    flags = Column(Text)
+    flag_count = Column(Integer)
+    checked_at = Column(DateTime, default=datetime.utcnow)
 
 
-# ─────────────────────────── Helper Functions ─────────────────────────────
+class ModelMetric(Base):
+    __tablename__ = "model_metrics"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_name = Column(String(60), nullable=False)
+    accuracy = Column(Float)
+    precision = Column(Float)
+    recall = Column(Float)
+    f1_score = Column(Float)
+    roc_auc = Column(Float)
+    recorded_at = Column(DateTime, default=datetime.utcnow)
 
-def init_db():
-    """Create all tables (idempotent)."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# ----------------------------------------------------------- population ---
+
+def create_tables():
+    Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    print(f"[database] Initialized SQLite DB at {DB_PATH}")
+    print("[database] Tables dropped & recreated.")
 
 
-def _upsert_df(df: pd.DataFrame, table_name: str):
-    """Write a DataFrame into the given table (replace strategy)."""
-    df.to_sql(table_name, engine, if_exists="replace", index=False)
+def _clear(table_cls):
+    session = Session()
+    session.query(table_cls).delete()
+    session.commit()
+    session.close()
+
+
+def populate_borrowers():
+    df = pd.read_csv(os.path.join(DATA_DIR, "borrowers_processed.csv"))
+    _clear(Borrower)
+    records = []
+    for _, row in df.iterrows():
+        records.append(Borrower(
+            borrower_id=row["borrower_id"],
+            credit_limit=row.get("credit_limit"),
+            gender=int(row.get("gender", 0)),
+            education=int(row.get("education", 0)),
+            marital_status=int(row.get("marital_status", 0)),
+            age=int(row.get("age", 0)),
+            default=int(row.get("default", 0)),
+        ))
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] borrowers: {len(records)} rows")
+
+
+def populate_risk_scores():
+    df = pd.read_csv(os.path.join(DATA_DIR, "risk_segments.csv"))
+    _clear(RiskScore)
+    records = [
+        RiskScore(
+            borrower_id=row["borrower_id"],
+            default_probability=row["default_probability"],
+            risk_tier=row["risk_tier"],
+            priority_score=row["priority_score"],
+        )
+        for _, row in df.iterrows()
+    ]
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] risk_scores: {len(records)} rows")
+
+
+def populate_collection_actions():
+    df = pd.read_csv(os.path.join(DATA_DIR, "collection_strategies.csv"))
+    _clear(CollectionAction)
+    records = [
+        CollectionAction(
+            borrower_id=row["borrower_id"],
+            risk_tier=row["risk_tier"],
+            recommended_action=row["recommended_action"],
+            channel=row["channel"],
+            urgency=row["urgency"],
+            follow_up_days=int(row["follow_up_days"]),
+        )
+        for _, row in df.iterrows()
+    ]
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] collection_actions: {len(records)} rows")
+
+
+def populate_communication_logs():
+    df = pd.read_csv(os.path.join(DATA_DIR, "communication_log.csv"))
+    _clear(CommunicationLog)
+    records = [
+        CommunicationLog(
+            borrower_id=row["borrower_id"],
+            risk_tier=row["risk_tier"],
+            channel=row["channel"],
+            template=row["template"],
+            message=row["message"],
+        )
+        for _, row in df.iterrows()
+    ]
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] communication_logs: {len(records)} rows")
+
+
+def populate_compliance_flags():
+    df = pd.read_csv(os.path.join(DATA_DIR, "compliance_flags.csv"))
+    _clear(ComplianceFlag)
+    records = [
+        ComplianceFlag(
+            borrower_id=row["borrower_id"],
+            risk_tier=row["risk_tier"],
+            flags=row["flags"],
+            flag_count=int(row["flag_count"]),
+        )
+        for _, row in df.iterrows()
+    ]
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] compliance_flags: {len(records)} rows")
+
+
+def populate_model_metrics():
+    metrics_path = os.path.join(MODELS_DIR, "metrics.json")
+    if not os.path.exists(metrics_path):
+        print("[database] metrics.json not found – skipping model_metrics.")
+        return
+    with open(metrics_path) as f:
+        metrics_list = json.load(f)
+    _clear(ModelMetric)
+    records = [
+        ModelMetric(
+            model_name=m["model"],
+            accuracy=m["accuracy"],
+            precision=m["precision"],
+            recall=m["recall"],
+            f1_score=m["f1_score"],
+            roc_auc=m["roc_auc"],
+        )
+        for m in metrics_list
+    ]
+    session = Session()
+    session.bulk_save_objects(records)
+    session.commit()
+    session.close()
+    print(f"[database] model_metrics: {len(records)} rows")
 
 
 def populate_all():
-    """Load all CSV outputs into the database."""
-    init_db()
-
-    data_dir = os.path.join(BASE_DIR, "data")
-
-    mappings = {
-        "borrowers": os.path.join(data_dir, "raw", "borrowers.csv"),
-        "risk_scores": os.path.join(data_dir, "processed", "risk_segments.csv"),
-        "collection_actions": os.path.join(data_dir, "processed", "collection_actions.csv"),
-        "communication_logs": os.path.join(data_dir, "processed", "communication_logs.csv"),
-        "compliance_flags": os.path.join(data_dir, "processed", "compliance_flags.csv"),
-    }
-
-    for table, csv_path in mappings.items():
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            # Only keep columns that match the expected table schema:
-            if table == "collection_actions":
-                keep = ["borrower_id", "recommended_action", "urgency_level", "priority_rank"]
-                df = df[[c for c in keep if c in df.columns]]
-            _upsert_df(df, table)
-            print(f"[database] Loaded {len(df)} rows -> {table}")
-        else:
-            print(f"[database] SKIP {table} ({csv_path} not found)")
+    create_tables()
+    populate_borrowers()
+    populate_risk_scores()
+    populate_collection_actions()
+    populate_communication_logs()
+    populate_compliance_flags()
+    populate_model_metrics()
+    print("[database] All 6 tables populated ✓")
 
 
 if __name__ == "__main__":

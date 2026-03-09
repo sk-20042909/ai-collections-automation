@@ -1,97 +1,93 @@
 """
-Communication Simulation Module
-=================================
-Generates borrower-facing messages (SMS / Email / Chatbot) using templates
-and logs the simulated interactions to the SQLite database.
+Communication Module
+====================
+Generates personalised outreach messages for each borrower based on their
+risk tier and recommended channel.
+
+Templates:
+    SMS       – concise payment reminder
+    Email     – formal notice with payment link
+    Chatbot   – conversational nudge
+    Payment Assistance – proactive assistance offer for high / very-high risk
 """
 
 import os
-import datetime
-import uuid
+from datetime import datetime
 import pandas as pd
 
-BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "processed")
 
-# ────────────────────────────── Message Templates ──────────────────────────
-
-TEMPLATES = {
-    "SMS reminder": (
-        "Hi {name}, this is a friendly reminder that your payment of "
-        "₹{amount} is overdue by {days} days.  Please pay at your earliest "
-        "convenience.  Ref: {ref}"
+TEMPLATES: dict[str, str] = {
+    "sms": (
+        "Hi {name}, this is a friendly reminder that your credit-card "
+        "account ({borrower_id}) has an outstanding balance. "
+        "Please make a payment at your earliest convenience. "
+        "Reply HELP for assistance."
     ),
-    "Call-center follow-up": (
-        "Subject: Payment Follow-Up – Account {ref}\n\n"
-        "Dear {name},\n\n"
-        "We noticed your account has an outstanding balance of ₹{amount}.  "
-        "Our team will reach out shortly to discuss a suitable repayment plan.\n\n"
+    "email": (
+        "Dear Valued Customer ({borrower_id}),\n\n"
+        "Our records indicate an outstanding balance on your account.  "
+        "Please arrange a payment by the due date to avoid late fees.\n\n"
+        "If you need help, contact us at support@collections.example.com\n\n"
         "Regards,\nCollections Team"
     ),
-    "Field collection escalation": (
-        "CHATBOT: Hello {name}, your account {ref} is significantly overdue "
-        "(₹{amount}, {days} days).  We'd like to help you find a resolution.  "
-        "Reply YES to schedule a call with an advisor."
+    "chatbot": (
+        "👋 Hey! Just checking in about your credit-card account "
+        "({borrower_id}). Would you like help setting up a payment plan? "
+        "Type YES to get started."
+    ),
+    "payment_assistance": (
+        "Dear Customer ({borrower_id}),\n\n"
+        "We understand that managing payments can be challenging. "
+        "Based on your account profile, you may qualify for a customised "
+        "payment plan or financial-hardship programme.\n\n"
+        "Please reply to this message or call 1-800-555-0199 to speak "
+        "with a dedicated account specialist.\n\n"
+        "We're here to help.\n"
+        "Collections Support Team"
     ),
 }
 
 
-def generate_messages(
-    actions_path: str | None = None,
-    raw_path: str | None = None,
-) -> pd.DataFrame:
-    """Create a message for each borrower based on their recommended action."""
-    if actions_path is None:
-        actions_path = os.path.join(
-            BASE_DIR, "data", "processed", "collection_actions.csv"
+def _pick_template(row: pd.Series) -> tuple[str, str]:
+    tier = row["risk_tier"]
+    if tier in ("High Risk", "Very High Risk"):
+        return "payment_assistance", TEMPLATES["payment_assistance"]
+    channel = str(row.get("channel", "")).lower()
+    if "sms" in channel:
+        return "sms", TEMPLATES["sms"]
+    if "phone" in channel or "email" in channel:
+        return "email", TEMPLATES["email"]
+    return "chatbot", TEMPLATES["chatbot"]
+
+
+def generate_messages(strategies_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, row in strategies_df.iterrows():
+        tpl_name, tpl = _pick_template(row)
+        message = tpl.format(
+            name="Customer",
+            borrower_id=row["borrower_id"],
         )
-    if raw_path is None:
-        raw_path = os.path.join(BASE_DIR, "data", "raw", "borrowers.csv")
-
-    actions = pd.read_csv(actions_path)
-    raw = pd.read_csv(raw_path)[
-        ["borrower_id", "outstanding_balance", "days_past_due"]
-    ]
-    df = actions.merge(raw, on="borrower_id", how="left")
-
-    records = []
-    for _, row in df.iterrows():
-        tmpl = TEMPLATES.get(row["recommended_action"], TEMPLATES["SMS reminder"])
-        msg = tmpl.format(
-            name=row["borrower_id"],
-            amount=f"{row.get('outstanding_balance', 0):,.2f}",
-            days=int(row.get("days_past_due", 0)),
-            ref=row["borrower_id"],
-        )
-        channel = {
-            "SMS reminder": "SMS",
-            "Call-center follow-up": "Email",
-            "Field collection escalation": "Chatbot",
-        }.get(row["recommended_action"], "SMS")
-
-        records.append(
-            {
-                "log_id": str(uuid.uuid4()),
-                "borrower_id": row["borrower_id"],
-                "channel": channel,
-                "message": msg,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "status": "sent",
-            }
-        )
-
-    return pd.DataFrame(records)
+        rows.append({
+            "borrower_id": row["borrower_id"],
+            "risk_tier": row["risk_tier"],
+            "channel": row.get("channel", "Email"),
+            "template": tpl_name,
+            "message": message,
+            "generated_at": datetime.now().isoformat(),
+        })
+    df = pd.DataFrame(rows)
+    out = os.path.join(DATA_DIR, "communication_log.csv")
+    df.to_csv(out, index=False)
+    print(f"[communication] {len(df)} messages generated -> {out}")
+    return df
 
 
-def save_communication_logs(output_dir: str | None = None) -> str:
-    df = generate_messages()
-    if output_dir is None:
-        output_dir = os.path.join(BASE_DIR, "data", "processed")
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "communication_logs.csv")
-    df.to_csv(path, index=False)
-    print(f"[communication] Generated {len(df)} messages -> {path}")
-    return path
+def run_communication() -> pd.DataFrame:
+    strats = pd.read_csv(os.path.join(DATA_DIR, "collection_strategies.csv"))
+    return generate_messages(strats)
 
 
 if __name__ == "__main__":
-    save_communication_logs()
+    run_communication()
